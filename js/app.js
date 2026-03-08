@@ -1,6 +1,6 @@
 const objects = [];
 let simRunning = false;
-let lastTime = null;
+let lastTime = performance.now();
 
 const canvas = document.getElementById('sim-canvas');
 const ctx = canvas.getContext('2d');
@@ -21,7 +21,7 @@ drawing.onObjectCreated = (obj) => { physics.addBody(obj); updateMeta(); };
 drawing.onObjectDeleted = (obj) => { physics.removeBody(obj); updateMeta(); };
 
 // Tool buttons
-const tools = { 'btn-select':'select','btn-pencil':'pencil','btn-line':'line','btn-rect':'rect','btn-circle':'circle','btn-stick':'stick' };
+const tools = { 'btn-draw': 'draw', 'btn-select': 'select', 'btn-stick': 'stick' };
 Object.entries(tools).forEach(([id, tool]) => {
   document.getElementById(id).addEventListener('click', () => {
     drawing.currentTool = tool;
@@ -30,13 +30,15 @@ Object.entries(tools).forEach(([id, tool]) => {
   });
 });
 
-// Play/Pause toggle
+// Undo
+document.getElementById('btn-undo').addEventListener('click', () => { drawing.undo(); updateMeta(); });
+
+// Play/Pause
 const toggleBtn = document.getElementById('btn-toggle-sim');
 toggleBtn.addEventListener('click', () => {
   simRunning = !simRunning;
   if (simRunning) {
     for (const obj of objects) obj.saveOrigin();
-    lastTime = performance.now();
     toggleBtn.textContent = 'PAUSE';
     toggleBtn.classList.add('active');
   } else {
@@ -70,27 +72,34 @@ windDirSlider.addEventListener('input', () => {
 
 // Transform
 document.getElementById('btn-rot-ccw').addEventListener('click', () => {
-  if (drawing.selectedObject) { drawing.selectedObject.rotate(-5 * Math.PI / 180); updateMeta(); }
+  for (const obj of drawing.selected) obj.rotate(-5 * Math.PI / 180);
+  updateMeta();
 });
 document.getElementById('btn-rot-cw').addEventListener('click', () => {
-  if (drawing.selectedObject) { drawing.selectedObject.rotate(5 * Math.PI / 180); updateMeta(); }
+  for (const obj of drawing.selected) obj.rotate(5 * Math.PI / 180);
+  updateMeta();
 });
 document.getElementById('btn-delete').addEventListener('click', () => {
-  if (drawing.selectedObject) {
-    physics.removeBody(drawing.selectedObject);
-    const idx = objects.indexOf(drawing.selectedObject);
-    if (idx !== -1) objects.splice(idx, 1);
-    drawing.selectObject(null);
-    updateMeta();
-  }
+  drawing.deleteSelected();
+  updateMeta();
 });
 
-// Metadata panel
+// Metadata
 function updateMeta() {
   const panel = document.getElementById('meta-content');
-  const obj = drawing.selectedObject;
-  if (!obj) { panel.innerHTML = '<p class="placeholder">Select an object</p>'; return; }
+  const sel = drawing.selected;
 
+  if (sel.length === 0) {
+    panel.innerHTML = '<p class="placeholder">Select an object</p>';
+    return;
+  }
+
+  if (sel.length > 1) {
+    panel.innerHTML = `<div class="meta-row"><span class="meta-label">Group</span><span class="meta-value">${sel.length} objects</span></div>`;
+    return;
+  }
+
+  const obj = sel[0];
   const body = physics.getBody(obj);
   const deg = ((obj.angle * 180 / Math.PI) % 360).toFixed(1);
   const mps = body ? body.speedMps.toFixed(1) : '0.0';
@@ -129,19 +138,21 @@ function updateMeta() {
     </div>
   `;
 
-  const sel = document.getElementById('meta-body-config');
-  if (sel && body) sel.addEventListener('change', () => { body.setBodyConfig(sel.value); updateMeta(); });
+  const cfgSel = document.getElementById('meta-body-config');
+  if (cfgSel && body) cfgSel.addEventListener('change', () => { body.setBodyConfig(cfgSel.value); updateMeta(); });
 }
 
-// Render loop
+// Render loop - wind always uses real dt, never hardcoded
 function render(now) {
   requestAnimationFrame(render);
 
-  const dt = simRunning && lastTime ? Math.min((now - lastTime) / 1000, 0.05) : 0;
+  const dt = Math.min((now - lastTime) / 1000, 0.05);
   lastTime = now;
 
   if (simRunning) physics.update(dt, wind.windVelocity);
-  wind.update(1 / 60, objects);
+
+  // Wind particles always use real frame dt - this fixes the stutter
+  wind.update(dt, objects);
 
   ctx.fillStyle = '#0d0d14';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -154,20 +165,14 @@ function render(now) {
 
   wind.render(ctx);
   for (const obj of objects) obj.render(ctx);
-  drawing.renderPreview();
+  drawing.renderPreview(ctx);
 
   // HUD
   ctx.fillStyle = 'rgba(100,120,200,0.5)';
   ctx.font = '11px Courier New';
-  ctx.fillText(`Wind: ${windSpeedSlider.value} m/s @ ${windDirSlider.value}deg | Particles: ${wind.count}`, 10, canvas.height - 30);
-  ctx.fillText(`Objects: ${objects.length} | ${simRunning ? 'RUNNING' : 'PAUSED'}`, 10, canvas.height - 14);
+  ctx.fillText(`Wind: ${windSpeedSlider.value} m/s @ ${windDirSlider.value}deg | Particles: ${wind.count}`, 10, canvas.height - 14);
 
-  if (drawing.selectedObject) {
-    const b = physics.getBody(drawing.selectedObject);
-    if (b) ctx.fillText(`Speed: ${b.speedMph.toFixed(0)} mph | Alt: ${b.altitude.toFixed(0)}m`, 10, canvas.height - 46);
-  }
-
-  if (simRunning && drawing.selectedObject) updateMeta();
+  if (simRunning && drawing.selected.length > 0) updateMeta();
 }
 
 requestAnimationFrame(render);

@@ -3,14 +3,12 @@ let objectIdCounter = 0;
 class SimObject {
   constructor(type, cx, cy) {
     this.id = ++objectIdCounter;
-    this.type = type;
+    this.type = type; // 'pencil' or 'stick'
     this.cx = cx;
     this.cy = cy;
-    this.angle = 0; // radians
-    this.points = []; // for freeform/line shapes
-    this.width = 0;
+    this.angle = 0;
+    this.points = []; // for pencil strokes (relative to cx,cy)
     this.height = 0;
-    this.radius = 0;
     this.boundingRadius = 30;
     this.pinned = false;
     this.mass = 80;
@@ -18,8 +16,6 @@ class SimObject {
     this.crossSection = 0.7;
     this.color = '#e0e0f0';
     this.selected = false;
-
-    // Store original position for reset
     this.originCx = cx;
     this.originCy = cy;
     this.originAngle = 0;
@@ -38,6 +34,20 @@ class SimObject {
   }
 
   hitTest(px, py) {
+    // For pencil strokes, check distance to any point
+    if (this.type === 'pencil' && this.points.length > 0) {
+      const cos = Math.cos(this.angle);
+      const sin = Math.sin(this.angle);
+      // Transform click into object local space
+      const lx = (px - this.cx) * cos + (py - this.cy) * sin;
+      const ly = -(px - this.cx) * sin + (py - this.cy) * cos;
+      for (let i = 0; i < this.points.length; i += 3) {
+        const dx = lx - this.points[i].x;
+        const dy = ly - this.points[i].y;
+        if (dx * dx + dy * dy < 400) return true; // 20px threshold
+      }
+      return false;
+    }
     const dx = px - this.cx;
     const dy = py - this.cy;
     return Math.sqrt(dx * dx + dy * dy) < this.boundingRadius + 10;
@@ -47,99 +57,69 @@ class SimObject {
     this.angle += deltaRad;
   }
 
-  flipHorizontal() {
-    // Mirror points around center
-    for (const pt of this.points) {
-      pt.x = -pt.x;
-    }
-    this.angle = -this.angle;
-  }
-
   render(ctx) {
     ctx.save();
     ctx.translate(this.cx, this.cy);
     ctx.rotate(this.angle);
 
     ctx.strokeStyle = this.selected ? '#ffaa44' : this.color;
-    ctx.lineWidth = this.selected ? 2.5 : 1.5;
-    ctx.fillStyle = 'transparent';
+    ctx.lineWidth = this.selected ? 4 : 3;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
 
-    switch (this.type) {
-      case 'pencil':
-        this.renderPencil(ctx);
-        break;
-      case 'line':
-        this.renderLine(ctx);
-        break;
-      case 'rect':
-        this.renderRect(ctx);
-        break;
-      case 'circle':
-        this.renderCircle(ctx);
-        break;
-      case 'stick':
-        this.renderStick(ctx);
-        break;
+    if (this.type === 'pencil') {
+      this.renderSmooth(ctx);
+    } else if (this.type === 'stick') {
+      this.renderStick(ctx);
     }
-
 
     ctx.restore();
   }
 
-  renderPencil(ctx) {
-    if (this.points.length < 2) return;
+  renderSmooth(ctx) {
+    const pts = this.points;
+    if (pts.length < 2) return;
+
     ctx.beginPath();
-    ctx.moveTo(this.points[0].x, this.points[0].y);
-    for (let i = 1; i < this.points.length; i++) {
-      ctx.lineTo(this.points[i].x, this.points[i].y);
+    ctx.moveTo(pts[0].x, pts[0].y);
+
+    if (pts.length === 2) {
+      ctx.lineTo(pts[1].x, pts[1].y);
+    } else {
+      // Quadratic bezier smoothing through points
+      for (let i = 1; i < pts.length - 1; i++) {
+        const mx = (pts[i].x + pts[i + 1].x) / 2;
+        const my = (pts[i].y + pts[i + 1].y) / 2;
+        ctx.quadraticCurveTo(pts[i].x, pts[i].y, mx, my);
+      }
+      const last = pts[pts.length - 1];
+      ctx.lineTo(last.x, last.y);
     }
     ctx.stroke();
   }
 
-  renderLine(ctx) {
-    if (this.points.length < 2) return;
-    ctx.beginPath();
-    ctx.moveTo(this.points[0].x, this.points[0].y);
-    ctx.lineTo(this.points[1].x, this.points[1].y);
-    ctx.stroke();
-  }
-
-  renderRect(ctx) {
-    ctx.strokeRect(-this.width / 2, -this.height / 2, this.width, this.height);
-  }
-
-  renderCircle(ctx) {
-    ctx.beginPath();
-    ctx.arc(0, 0, this.radius, 0, Math.PI * 2);
-    ctx.stroke();
-  }
-
   renderStick(ctx) {
-    const h = this.height || 60;
+    const h = this.height || 80;
     const headR = h * 0.15;
     const bodyLen = h * 0.4;
     const legLen = h * 0.3;
     const armLen = h * 0.25;
     const armY = -h / 2 + headR * 2 + bodyLen * 0.3;
 
-    // Head
     ctx.beginPath();
     ctx.arc(0, -h / 2 + headR, headR, 0, Math.PI * 2);
     ctx.stroke();
 
-    // Body
     ctx.beginPath();
     ctx.moveTo(0, -h / 2 + headR * 2);
     ctx.lineTo(0, -h / 2 + headR * 2 + bodyLen);
     ctx.stroke();
 
-    // Arms
     ctx.beginPath();
     ctx.moveTo(-armLen, armY);
     ctx.lineTo(armLen, armY);
     ctx.stroke();
 
-    // Legs
     const hipY = -h / 2 + headR * 2 + bodyLen;
     ctx.beginPath();
     ctx.moveTo(0, hipY);
@@ -149,6 +129,19 @@ class SimObject {
     ctx.stroke();
 
     this.boundingRadius = h / 2 + 5;
+  }
+
+  computeBounds() {
+    if (this.type === 'stick') {
+      this.boundingRadius = (this.height || 80) / 2 + 5;
+      return;
+    }
+    let maxR = 0;
+    for (const p of this.points) {
+      const r = Math.sqrt(p.x * p.x + p.y * p.y);
+      if (r > maxR) maxR = r;
+    }
+    this.boundingRadius = Math.max(maxR, 15);
   }
 }
 
