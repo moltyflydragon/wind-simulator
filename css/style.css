@@ -1,0 +1,159 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Courier New', monospace;
+  background: #0a0a0f;
+  color: #c8c8d0;
+  overflow: hidden;
+  height: 100vh;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+#toolbar {
+  display: flex;
+  gap: 16px;
+  padding: 8px 12px;
+  background: #141420;
+  border-bottom: 1px solid #2a2a3a;
+  flex-wrap: wrap;
+  align-items: center;
+  z-index: 10;
+}
+
+.tool-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.group-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  color: #666;
+  margin-right: 4px;
+}
+
+.tool-btn {
+  background: #1e1e2e;
+  color: #aaa;
+  border: 1px solid #333;
+  padding: 4px 10px;
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  border-radius: 3px;
+  transition: all 0.15s;
+}
+
+.tool-btn:hover {
+  background: #2a2a4a;
+  color: #ddd;
+}
+
+.tool-btn.active {
+  background: #3a3a6a;
+  color: #fff;
+  border-color: #5a5a9a;
+}
+
+.tool-btn.danger {
+  border-color: #633;
+}
+
+.tool-btn.danger:hover {
+  background: #4a1a1a;
+  color: #f88;
+}
+
+#toolbar label {
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: #888;
+}
+
+#toolbar input[type="range"] {
+  width: 80px;
+  accent-color: #5a5aaa;
+}
+
+#toolbar span {
+  font-size: 10px;
+  min-width: 50px;
+  color: #7a7aaa;
+}
+
+#workspace {
+  flex: 1;
+  display: flex;
+  position: relative;
+  overflow: hidden;
+}
+
+#sim-canvas {
+  flex: 1;
+  cursor: crosshair;
+}
+
+#meta-panel {
+  width: 220px;
+  background: #111118;
+  border-left: 1px solid #2a2a3a;
+  padding: 12px;
+  overflow-y: auto;
+}
+
+#meta-panel h3 {
+  font-size: 12px;
+  color: #888;
+  text-transform: uppercase;
+  margin-bottom: 10px;
+  border-bottom: 1px solid #222;
+  padding-bottom: 6px;
+}
+
+#meta-content .placeholder {
+  font-size: 11px;
+  color: #555;
+  font-style: italic;
+}
+
+.meta-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  padding: 3px 0;
+  border-bottom: 1px solid #1a1a22;
+}
+
+.meta-label {
+  color: #666;
+}
+
+.meta-value {
+  color: #aab;
+  font-weight: bold;
+}
+
+.meta-section {
+  margin-top: 10px;
+  padding-top: 6px;
+  border-top: 1px solid #2a2a3a;
+}
+
+.meta-section-title {
+  font-size: 10px;
+  text-transform: uppercase;
+  color: #5a5a8a;
+  margin-bottom: 4px;
+}
