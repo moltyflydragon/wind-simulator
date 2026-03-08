@@ -35,20 +35,18 @@ struct Vec2 {
 // ── Stroke ──────────────────────────────────────────────────────────────────
 
 struct Stroke {
-    std::vector<Vec2> points; // in local space (relative to center)
-    Vec2 center;
+    std::vector<Vec2> points; // local space relative to stroke offset
+    Vec2 offset;              // offset from body center
     float radius = 0;
 
     void computeBounds() {
         if (points.empty()) return;
-        // Compute centroid
+        // Compute centroid and recenter
         Vec2 sum{0,0};
         for (auto& p : points) sum += p;
         Vec2 centroid = sum * (1.0f / points.size());
-        // Re-center points
         for (auto& p : points) p = p - centroid;
-        center = center + centroid;
-        // Bounding radius
+        offset = offset + centroid;
         radius = 0;
         for (auto& p : points) {
             float r = p.mag();
@@ -58,28 +56,26 @@ struct Stroke {
     }
 };
 
-// ── Body (grouped strokes = single physics object) ─────────────────────────
+// ── Body ────────────────────────────────────────────────────────────────────
 
 struct Body {
     std::vector<Stroke> strokes;
     Vec2 center;
     float angle = 0;
-    float radius = 30; // effective radius for flow computation
+    float radius = 30;
 
-    // Physics
-    float mass = 80.0f;      // kg
+    float mass = 80.0f;
     float dragCoef = 0.75f;
-    float crossSection = 0.7f; // m^2
-    float altitude = 4000.0f;  // m
+    float crossSection = 0.7f;
+    float altitude = 4000.0f;
     Vec2 velocity{0,0};
     Vec2 acceleration{0,0};
     float speedMps = 0;
     float terminalV = 0;
     float relWindSpeed = 0;
-    float relWindAngle = 0; // AoA in degrees
+    float relWindAngle = 0;
     float airDensity = 1.225f;
 
-    // State
     bool selected = false;
     bool pinned = false;
     Vec2 originCenter;
@@ -95,8 +91,7 @@ struct Body {
     void computeRadius() {
         radius = 0;
         for (auto& s : strokes) {
-            Vec2 off = s.center - center;
-            float r = off.mag() + s.radius;
+            float r = s.offset.mag() + s.radius;
             if (r > radius) radius = r;
         }
         radius = fmaxf(radius, 15.0f);
@@ -105,25 +100,22 @@ struct Body {
     void recomputeCenter() {
         if (strokes.empty()) return;
         Vec2 sum{0,0};
-        for (auto& s : strokes) sum += s.center;
-        Vec2 newCenter = sum * (1.0f / strokes.size());
-        // Offset stroke centers relative to new body center
-        for (auto& s : strokes) s.center = s.center - newCenter;
-        center = newCenter;
+        for (auto& s : strokes) sum += s.offset;
+        Vec2 shift = sum * (1.0f / strokes.size());
+        for (auto& s : strokes) s.offset = s.offset - shift;
+        center = center + shift;
         computeRadius();
     }
 
     bool hitTest(Vec2 p) const {
-        // Test against each stroke's points (transformed)
-        float c = cosf(angle), s = sinf(angle);
+        float c = cosf(-angle), s = sinf(-angle);
+        Vec2 local = p - center;
+        local = {local.x*c - local.y*s, local.x*s + local.y*c};
         for (auto& st : strokes) {
+            Vec2 rel = local - st.offset;
             for (size_t i = 0; i < st.points.size(); i += 2) {
-                // Rotate stroke center by body angle, then add body center
-                Vec2 sc = {st.center.x*c - st.center.y*s, st.center.x*s + st.center.y*c};
-                Vec2 pt = {st.points[i].x*c - st.points[i].y*s, st.points[i].x*s + st.points[i].y*c};
-                Vec2 worldPt = center + sc + pt;
-                float dx = p.x - worldPt.x;
-                float dy = p.y - worldPt.y;
+                float dx = rel.x - st.points[i].x;
+                float dy = rel.y - st.points[i].y;
                 if (dx*dx + dy*dy < 400.0f) return true;
             }
         }
@@ -131,115 +123,96 @@ struct Body {
     }
 };
 
-// ── Potential Flow Field ────────────────────────────────────────────────────
-// Real physics: flow around cylinders using potential flow theory.
-// Each body is approximated as a cylinder. The velocity field is computed
-// from the analytical solution (dipole perturbation), NOT fake push-away.
+// ── Potential Flow ──────────────────────────────────────────────────────────
 
-Vec2 flowFieldAt(Vec2 pos, Vec2 wind, const std::vector<Body>& bodies) {
-    // Start with uniform wind
-    Vec2 vel = wind;
+struct FlowBody {
+    float cx, cy, R2; // center and radius squared
+};
 
-    for (auto& body : bodies) {
-        Vec2 d = pos - body.center;
-        float r2 = d.mag2();
-        float R = body.radius;
-        float R2 = R * R;
-
-        // Skip if inside or too close to body
-        if (r2 < R2 * 1.05f) {
-            // Inside body: kill velocity (no flow inside solid)
-            return {0, 0};
-        }
-
-        // Potential flow dipole perturbation:
-        // For uniform flow U past cylinder radius R:
-        // u_x = U_x - R^2/r^4 * (U_x*(dx^2 - dy^2) + 2*U_y*dx*dy)
-        // u_y = U_y - R^2/r^4 * (U_y*(dy^2 - dx^2) + 2*U_x*dx*dy)
-        float r4 = r2 * r2;
-        float factor = R2 / r4;
-        float dxdy2 = 2.0f * d.x * d.y;
-        float dx2mdy2 = d.x * d.x - d.y * d.y;
-
-        vel.x -= factor * (wind.x * dx2mdy2 + wind.y * dxdy2);
-        vel.y -= factor * (wind.y * (-dx2mdy2) + wind.x * dxdy2);
+Vec2 flowFieldAt(float px, float py, float wx, float wy,
+                 const FlowBody* fb, int fbCount) {
+    float vx = wx, vy = wy;
+    for (int j = 0; j < fbCount; j++) {
+        float dx = px - fb[j].cx;
+        float dy = py - fb[j].cy;
+        float r2 = dx*dx + dy*dy;
+        if (r2 < fb[j].R2 * 1.05f) return {0, 0};
+        float factor = fb[j].R2 / (r2 * r2);
+        float dx2mdy2 = dx*dx - dy*dy;
+        float dxdy2 = 2.0f * dx * dy;
+        vx -= factor * (wx * dx2mdy2 + wy * dxdy2);
+        vy -= factor * (-wy * dx2mdy2 + wx * dxdy2);
     }
-
-    return vel;
+    return {vx, vy};
 }
 
-// ── Particle System (SoA, cache-friendly) ───────────────────────────────────
+// ── Particle System ─────────────────────────────────────────────────────────
 
-static constexpr int MAX_PARTICLES = 100000;
+static constexpr int MAX_PARTICLES = 30000;
 
 struct Particles {
     float* x;
     float* y;
     float* life;
+    float* uploadBuf; // persistent upload buffer
     int count = 0;
     float spawnAccum = 0;
-
     GLuint vao = 0, vbo = 0;
 
     void init() {
         x = new float[MAX_PARTICLES];
         y = new float[MAX_PARTICLES];
         life = new float[MAX_PARTICLES];
+        uploadBuf = new float[MAX_PARTICLES * 3];
 
         glGenVertexArrays(1, &vao);
         glGenBuffers(1, &vbo);
         glBindVertexArray(vao);
         glBindBuffer(GL_ARRAY_BUFFER, vbo);
-        // Will hold interleaved x,y,life
-        glBufferData(GL_ARRAY_BUFFER, MAX_PARTICLES * 3 * sizeof(float), nullptr, GL_DYNAMIC_DRAW);
+        glBufferData(GL_ARRAY_BUFFER, MAX_PARTICLES * 3 * sizeof(float), nullptr, GL_STREAM_DRAW);
         glEnableVertexAttribArray(0);
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3*sizeof(float), 0);
         glBindVertexArray(0);
     }
 
     void update(float dt, Vec2 wind, Vec2 windDir, float windSpeed, int screenW, int screenH,
-                const std::vector<Body>& bodies) {
+                const FlowBody* fb, int fbCount) {
         if (windSpeed < 0.5f) { count = 0; return; }
 
-        // Spawn: rate proportional to dt and wind speed
-        spawnAccum += windSpeed * 800.0f * dt;
+        float w = (float)screenW, h = (float)screenH;
+
+        // Spawn
+        spawnAccum += windSpeed * 400.0f * dt;
         int toSpawn = (int)spawnAccum;
         spawnAccum -= toSpawn;
 
-        float w = (float)screenW, h = (float)screenH;
         float absDx = fabsf(windDir.x), absDy = fabsf(windDir.y);
-        float spd = windSpeed * 10.0f;
-
         for (int i = 0; i < toSpawn && count < MAX_PARTICLES; i++) {
             int idx = count++;
             float r1 = (float)rand() / RAND_MAX;
             float r2 = (float)rand() / RAND_MAX;
-
-            if (r1 < 0.1f) {
-                // Scatter spawn across canvas
+            if (r1 < 0.08f) {
                 x[idx] = r2 * w;
                 y[idx] = ((float)rand()/RAND_MAX) * h;
             } else if (absDx > absDy) {
-                x[idx] = windDir.x > 0 ? -r2*15.0f : w + r2*15.0f;
+                x[idx] = windDir.x > 0 ? -r2*10.0f : w + r2*10.0f;
                 y[idx] = r2 * h;
             } else {
                 x[idx] = r2 * w;
-                y[idx] = windDir.y > 0 ? -r2*15.0f : h + r2*15.0f;
+                y[idx] = windDir.y > 0 ? -r2*10.0f : h + r2*10.0f;
             }
-            life[idx] = 0.5f + ((float)rand()/RAND_MAX) * 0.5f;
+            life[idx] = 0.5f + r1 * 0.5f;
         }
 
-        float decay = 0.3f * dt;
+        float decay = 0.25f * dt;
+        float wx = wind.x, wy = wind.y;
         int alive = 0;
 
         for (int i = 0; i < count; i++) {
             float plife = life[i] - decay;
             if (plife <= 0 || x[i] < -50 || x[i] > w+50 || y[i] < -50 || y[i] > h+50) continue;
 
-            // Compute flow field at particle position (real potential flow)
-            Vec2 flow = flowFieldAt({x[i], y[i]}, wind, bodies);
-
-            // Move particle along flow field
+            Vec2 flow = flowFieldAt(x[i], y[i], wx, wy, fb, fbCount);
             x[alive] = x[i] + flow.x * dt;
             y[alive] = y[i] + flow.y * dt;
             life[alive] = plife;
@@ -248,26 +221,22 @@ struct Particles {
         count = alive;
     }
 
-    void uploadAndRender(int screenW, int screenH) {
+    void uploadAndRender() {
         if (count == 0) return;
-
-        // Upload interleaved data
-        std::vector<float> data(count * 3);
         for (int i = 0; i < count; i++) {
-            data[i*3+0] = x[i];
-            data[i*3+1] = y[i];
-            data[i*3+2] = life[i];
+            uploadBuf[i*3+0] = x[i];
+            uploadBuf[i*3+1] = y[i];
+            uploadBuf[i*3+2] = life[i];
         }
         glBindBuffer(GL_ARRAY_BUFFER, vbo);
-        glBufferSubData(GL_ARRAY_BUFFER, 0, count * 3 * sizeof(float), data.data());
-
+        glBufferSubData(GL_ARRAY_BUFFER, 0, count * 3 * sizeof(float), uploadBuf);
         glBindVertexArray(vao);
         glDrawArrays(GL_POINTS, 0, count);
         glBindVertexArray(0);
     }
 
     void cleanup() {
-        delete[] x; delete[] y; delete[] life;
+        delete[] x; delete[] y; delete[] life; delete[] uploadBuf;
         glDeleteBuffers(1, &vbo);
         glDeleteVertexArrays(1, &vao);
     }
@@ -277,7 +246,7 @@ struct Particles {
 
 static const char* particleVertSrc = R"(
 #version 330 core
-layout(location = 0) in vec3 aData; // x, y, life
+layout(location = 0) in vec3 aData;
 uniform vec2 uScreen;
 out float vLife;
 void main() {
@@ -339,12 +308,12 @@ GLuint createProgram(const char* vertSrc, const char* fragSrc) {
     return p;
 }
 
-// ── Stroke Rendering ────────────────────────────────────────────────────────
-// Renders thick lines as triangle strips for proper width
+// ── Line Renderer (batched) ─────────────────────────────────────────────────
 
 struct LineRenderer {
     GLuint vao = 0, vbo = 0;
     GLuint program = 0;
+    std::vector<float> batch;
 
     void init() {
         program = createProgram(lineVertSrc, lineFragSrc);
@@ -357,34 +326,39 @@ struct LineRenderer {
         glBindVertexArray(0);
     }
 
-    // Generate triangle strip vertices for a thick polyline
     void drawThickLine(const std::vector<Vec2>& pts, Vec2 offset, float angle,
                        float thickness, float r, float g, float b, float a,
                        int screenW, int screenH) {
         if (pts.size() < 2) return;
 
-        // Transform points: rotate by angle then translate by offset
-        std::vector<Vec2> world(pts.size());
         float ca = cosf(angle), sa = sinf(angle);
+        float half = thickness * 0.5f;
+
+        batch.clear();
         for (size_t i = 0; i < pts.size(); i++) {
             Vec2 p = pts[i];
-            world[i] = {offset.x + p.x*ca - p.y*sa, offset.y + p.x*sa + p.y*ca};
-        }
+            Vec2 w = {offset.x + p.x*ca - p.y*sa, offset.y + p.x*sa + p.y*ca};
 
-        // Build triangle strip for thick line
-        std::vector<float> verts;
-        float half = thickness * 0.5f;
-        for (size_t i = 0; i < world.size(); i++) {
             Vec2 dir;
-            if (i == 0) dir = (world[1] - world[0]).norm();
-            else if (i == world.size()-1) dir = (world[i] - world[i-1]).norm();
-            else dir = (world[i+1] - world[i-1]).norm().norm();
+            if (pts.size() == 1) { dir = {1,0}; }
+            else if (i == 0) {
+                Vec2 p1 = pts[1];
+                Vec2 w1 = {offset.x + p1.x*ca - p1.y*sa, offset.y + p1.x*sa + p1.y*ca};
+                dir = (w1 - w).norm();
+            } else if (i == pts.size()-1) {
+                Vec2 pp = pts[i-1];
+                Vec2 wp = {offset.x + pp.x*ca - pp.y*sa, offset.y + pp.x*sa + pp.y*ca};
+                dir = (w - wp).norm();
+            } else {
+                Vec2 pp = pts[i-1], pn = pts[i+1];
+                Vec2 wp = {offset.x + pp.x*ca - pp.y*sa, offset.y + pp.x*sa + pp.y*ca};
+                Vec2 wn = {offset.x + pn.x*ca - pn.y*sa, offset.y + pn.x*sa + pn.y*ca};
+                dir = (wn - wp).norm();
+            }
 
             Vec2 n = dir.perp();
-            verts.push_back(world[i].x + n.x*half);
-            verts.push_back(world[i].y + n.y*half);
-            verts.push_back(world[i].x - n.x*half);
-            verts.push_back(world[i].y - n.y*half);
+            batch.push_back(w.x + n.x*half); batch.push_back(w.y + n.y*half);
+            batch.push_back(w.x - n.x*half); batch.push_back(w.y - n.y*half);
         }
 
         glUseProgram(program);
@@ -393,13 +367,62 @@ struct LineRenderer {
 
         glBindVertexArray(vao);
         glBindBuffer(GL_ARRAY_BUFFER, vbo);
-        glBufferData(GL_ARRAY_BUFFER, verts.size()*sizeof(float), verts.data(), GL_DYNAMIC_DRAW);
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, (int)(verts.size()/2));
+        glBufferData(GL_ARRAY_BUFFER, batch.size()*sizeof(float), batch.data(), GL_STREAM_DRAW);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, (int)(batch.size()/2));
         glBindVertexArray(0);
     }
 
     void cleanup() {
         glDeleteProgram(program);
+        glDeleteBuffers(1, &vbo);
+        glDeleteVertexArrays(1, &vao);
+    }
+};
+
+// ── Grid Renderer (single draw call) ────────────────────────────────────────
+
+struct GridRenderer {
+    GLuint vao = 0, vbo = 0;
+    GLuint program = 0;
+    int vertCount = 0;
+
+    void init(GLuint prog) {
+        program = prog;
+        glGenVertexArrays(1, &vao);
+        glGenBuffers(1, &vbo);
+        glBindVertexArray(vao);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+        glBindVertexArray(0);
+    }
+
+    void rebuild(int w, int h) {
+        std::vector<float> verts;
+        for (float x = 0; x < w; x += 50) {
+            verts.push_back(x); verts.push_back(0);
+            verts.push_back(x); verts.push_back((float)h);
+        }
+        for (float y = 0; y < h; y += 50) {
+            verts.push_back(0);      verts.push_back(y);
+            verts.push_back((float)w); verts.push_back(y);
+        }
+        vertCount = (int)(verts.size() / 2);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, verts.size()*sizeof(float), verts.data(), GL_STATIC_DRAW);
+    }
+
+    void render(int w, int h) {
+        if (vertCount == 0) return;
+        glUseProgram(program);
+        glUniform2f(glGetUniformLocation(program, "uScreen"), (float)w, (float)h);
+        glUniform4f(glGetUniformLocation(program, "uColor"), 1, 1, 1, 0.04f);
+        glBindVertexArray(vao);
+        glDrawArrays(GL_LINES, 0, vertCount);
+        glBindVertexArray(0);
+    }
+
+    void cleanup() {
         glDeleteBuffers(1, &vbo);
         glDeleteVertexArrays(1, &vao);
     }
@@ -411,54 +434,44 @@ static constexpr float GRAVITY = 9.81f;
 static constexpr float SEA_LEVEL_RHO = 1.225f;
 static constexpr float PX_PER_METER = 10.0f;
 
-float airDensity(float alt) {
+float airDensityAt(float alt) {
     return SEA_LEVEL_RHO * expf(-alt / 8500.0f);
 }
 
 void physicsStep(Body& body, float dt, Vec2 windVelocity) {
     if (body.pinned) return;
-
-    float rho = airDensity(body.altitude);
+    float rho = airDensityAt(body.altitude);
     body.airDensity = rho;
 
-    // Relative wind
     Vec2 relWind = windVelocity - body.velocity;
     body.relWindSpeed = relWind.mag();
 
-    // Angle of attack
     Vec2 bodyDir = Vec2{1,0}.rotate(body.angle);
     if (body.relWindSpeed > 0.01f) {
-        float d = bodyDir.dot(relWind.norm());
-        d = fmaxf(-1.0f, fminf(1.0f, d));
+        float d = fmaxf(-1.0f, fminf(1.0f, bodyDir.dot(relWind.norm())));
         body.relWindAngle = acosf(d) * 180.0f / M_PI;
     } else {
         body.relWindAngle = 0;
     }
 
     float aoaRad = body.relWindAngle * M_PI / 180.0f;
-
-    // Effective Cd varies with AoA
     float cdMul = 0.6f + 0.4f * powf(fabsf(sinf(aoaRad)), 1.2f);
     float effCd = body.dragCoef * cdMul;
     float effArea = body.crossSection * (0.5f + 0.5f * fabsf(sinf(aoaRad)));
 
-    // Drag: F = 0.5 * rho * v^2 * Cd * A
     float v2 = body.relWindSpeed * body.relWindSpeed;
     float dragMag = 0.5f * rho * v2 * effCd * effArea;
     Vec2 dragForce = body.relWindSpeed > 0.01f ? relWind.norm() * dragMag : Vec2{0,0};
 
-    // Lift: perpendicular to wind
     float liftCoef = 0.4f * sinf(2.0f * aoaRad);
     float liftMag = 0.5f * rho * v2 * fabsf(liftCoef) * effArea;
     Vec2 liftForce{0,0};
     if (body.relWindSpeed > 0.01f && fabsf(liftCoef) > 0.001f) {
         Vec2 wn = relWind.norm();
         float cross = bodyDir.x * wn.y - bodyDir.y * wn.x;
-        Vec2 liftDir = wn.perp();
-        liftForce = liftDir * (liftMag * (cross >= 0 ? 1.0f : -1.0f));
+        liftForce = wn.perp() * (liftMag * (cross >= 0 ? 1.0f : -1.0f));
     }
 
-    // Gravity
     Vec2 gravity{0, body.mass * GRAVITY};
     Vec2 total = gravity + dragForce + liftForce;
     body.acceleration = total * (1.0f / body.mass);
@@ -467,43 +480,36 @@ void physicsStep(Body& body, float dt, Vec2 windVelocity) {
     body.altitude -= body.velocity.y * dt;
     if (body.altitude < 0) body.altitude = 0;
     body.terminalV = sqrtf(2.0f * body.mass * GRAVITY / (rho * effCd * effArea));
-
     body.center += body.velocity * (dt * PX_PER_METER);
 }
 
 // ── Application ─────────────────────────────────────────────────────────────
 
 struct App {
-    // Window
     SDL_Window* window = nullptr;
     SDL_GLContext gl;
     int screenW = 1400, screenH = 900;
+    int lastGridW = 0, lastGridH = 0;
 
-    // Rendering
     GLuint particleProgram = 0;
     Particles particles;
     LineRenderer lineRenderer;
+    GridRenderer gridRenderer;
 
-    // State
     std::vector<Body> bodies;
-    std::deque<Body> undoStack; // snapshot of removed bodies for undo
+    std::vector<FlowBody> flowBodies; // cached per frame
 
-    // Drawing
     bool isDrawing = false;
     Stroke currentStroke;
     Vec2 drawOrigin;
 
-    // Selection
-    std::vector<int> selected; // indices into bodies
+    std::vector<int> selected;
     bool isDragging = false;
     Vec2 dragStart;
     bool isBoxSelecting = false;
     Vec2 boxStart, boxEnd;
 
-    // Tool: 0=draw, 1=select, 2=stick
-    int tool = 0;
-
-    // Simulation
+    int tool = 0; // 0=draw, 1=select, 2=stick
     bool simRunning = false;
     float windSpeed = 30.0f;
     float windAngleDeg = 270.0f;
@@ -514,6 +520,13 @@ struct App {
     }
     Vec2 windVelocity() const { return windDir() * windSpeed; }
     Vec2 windPixelVel() const { return windDir() * (windSpeed * 10.0f); }
+
+    float dpiScale() const {
+        int dw, dh, ww, wh;
+        SDL_GL_GetDrawableSize(window, &dw, &dh);
+        SDL_GetWindowSize(window, &ww, &wh);
+        return (float)dw / (float)ww;
+    }
 
     void init() {
         SDL_Init(SDL_INIT_VIDEO);
@@ -526,21 +539,17 @@ struct App {
             SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
             screenW, screenH, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
         gl = SDL_GL_CreateContext(window);
-        SDL_GL_SetSwapInterval(1); // vsync
+        SDL_GL_SetSwapInterval(1);
 
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         glEnable(GL_PROGRAM_POINT_SIZE);
         glEnable(GL_MULTISAMPLE);
-        glEnable(GL_LINE_SMOOTH);
 
-        // ImGui
         IMGUI_CHECKVERSION();
         ImGui::CreateContext();
-        ImGuiIO& io = ImGui::GetIO();
-        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+        ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
         ImGui::StyleColorsDark();
-        // Darken the style
         ImGuiStyle& style = ImGui::GetStyle();
         style.WindowRounding = 4;
         style.FrameRounding = 2;
@@ -549,14 +558,14 @@ struct App {
         ImGui_ImplSDL2_InitForOpenGL(window, gl);
         ImGui_ImplOpenGL3_Init("#version 330");
 
-        // Shaders
         particleProgram = createProgram(particleVertSrc, particleFragSrc);
         particles.init();
         lineRenderer.init();
+        gridRenderer.init(lineRenderer.program);
     }
 
     void deselectAll() {
-        for (int i : selected) bodies[i].selected = false;
+        for (int i : selected) if (i < (int)bodies.size()) bodies[i].selected = false;
         selected.clear();
     }
 
@@ -567,21 +576,21 @@ struct App {
     }
 
     void groupSelected() {
-        // Merge all selected bodies into one
         if (selected.size() < 2) return;
-
         Body merged;
+        merged.mass = 0;
+        merged.crossSection = 0;
         for (int idx : selected) {
             Body& b = bodies[idx];
             float ca = cosf(b.angle), sa = sinf(b.angle);
             for (auto& s : b.strokes) {
                 Stroke ns = s;
-                // Transform stroke center by body angle
-                ns.center = {
-                    b.center.x + s.center.x * ca - s.center.y * sa,
-                    b.center.y + s.center.x * sa + s.center.y * ca
+                // Transform offset by body angle, then add body center
+                Vec2 worldOff = {
+                    b.center.x + s.offset.x * ca - s.offset.y * sa,
+                    b.center.y + s.offset.x * sa + s.offset.y * ca
                 };
-                // Rotate stroke points by body angle
+                ns.offset = worldOff;
                 for (auto& p : ns.points) p = p.rotate(b.angle);
                 merged.strokes.push_back(ns);
             }
@@ -589,7 +598,6 @@ struct App {
             merged.crossSection += b.crossSection;
         }
 
-        // Remove selected bodies (in reverse order to preserve indices)
         std::sort(selected.begin(), selected.end(), std::greater<int>());
         for (int idx : selected) bodies.erase(bodies.begin() + idx);
         selected.clear();
@@ -604,35 +612,33 @@ struct App {
 
     void undo() {
         if (bodies.empty()) return;
-        // Remove last body
-        Body b = bodies.back();
         bodies.pop_back();
-        undoStack.push_back(b);
-        // Clean up selection
         selected.erase(std::remove_if(selected.begin(), selected.end(),
             [&](int i){ return i >= (int)bodies.size(); }), selected.end());
+    }
+
+    void deleteSelected() {
+        std::sort(selected.begin(), selected.end(), std::greater<int>());
+        for (int idx : selected) bodies.erase(bodies.begin() + idx);
+        selected.clear();
     }
 
     void handleEvent(SDL_Event& e) {
         ImGuiIO& io = ImGui::GetIO();
         if (io.WantCaptureMouse || io.WantCaptureKeyboard) return;
 
-        if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT) {
-            int mx = e.button.x, my = e.button.y;
-            // Scale for high-DPI
-            int dw, dh; SDL_GL_GetDrawableSize(window, &dw, &dh);
-            int ww, wh; SDL_GetWindowSize(window, &ww, &wh);
-            float sx = (float)dw/ww, sy = (float)dh/wh;
-            float fx = mx * sx, fy = my * sy;
+        float s = dpiScale();
 
-            if (tool == 0) { // Draw
+        if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT) {
+            float fx = e.button.x * s, fy = e.button.y * s;
+
+            if (tool == 0) {
                 isDrawing = true;
                 drawOrigin = {fx, fy};
                 currentStroke = Stroke{};
-                currentStroke.center = drawOrigin;
+                currentStroke.offset = {0, 0};
                 currentStroke.points.push_back({0, 0});
-            } else if (tool == 1) { // Select
-                // Check if clicking on already-selected body for drag
+            } else if (tool == 1) {
                 for (int idx : selected) {
                     if (bodies[idx].hitTest({fx, fy})) {
                         isDragging = true;
@@ -640,7 +646,6 @@ struct App {
                         return;
                     }
                 }
-                // Check if clicking any body
                 deselectAll();
                 for (int i = (int)bodies.size()-1; i >= 0; i--) {
                     if (bodies[i].hitTest({fx, fy})) {
@@ -650,46 +655,42 @@ struct App {
                         return;
                     }
                 }
-                // Start box select
                 isBoxSelecting = true;
                 boxStart = boxEnd = {fx, fy};
-            } else if (tool == 2) { // Stick figure
+            } else if (tool == 2) {
                 Body b;
-                Stroke head, bodyLine, arms, legL, legR;
                 float h = 80.0f, headR = h*0.15f;
-                // Head (circle approximation)
+                Stroke head; head.offset = {0, 0};
                 for (int i = 0; i <= 20; i++) {
                     float a = (float)i / 20.0f * 2.0f * M_PI;
                     head.points.push_back({cosf(a)*headR, -h/2+headR + sinf(a)*headR});
                 }
-                head.center = {0, 0};
                 head.computeBounds();
-                // Body
+
+                Stroke bodyLine; bodyLine.offset = {0, 0};
                 bodyLine.points.push_back({0, -h/2 + headR*2});
                 bodyLine.points.push_back({0, -h/2 + headR*2 + h*0.4f});
-                bodyLine.center = {0, 0};
                 bodyLine.computeBounds();
-                // Arms
+
                 float armY = -h/2 + headR*2 + h*0.12f;
+                Stroke arms; arms.offset = {0, 0};
                 arms.points.push_back({-h*0.25f, armY});
                 arms.points.push_back({h*0.25f, armY});
-                arms.center = {0, 0};
                 arms.computeBounds();
-                // Legs
+
                 float hipY = -h/2 + headR*2 + h*0.4f;
+                Stroke legL; legL.offset = {0, 0};
                 legL.points.push_back({0, hipY});
                 legL.points.push_back({-h*0.18f, hipY + h*0.3f});
-                legL.center = {0, 0};
                 legL.computeBounds();
+                Stroke legR; legR.offset = {0, 0};
                 legR.points.push_back({0, hipY});
                 legR.points.push_back({h*0.18f, hipY + h*0.3f});
-                legR.center = {0, 0};
                 legR.computeBounds();
 
                 b.strokes = {head, bodyLine, arms, legL, legR};
                 b.center = {fx, fy};
-                b.recomputeCenter();
-                b.center = {fx, fy}; // force to click pos
+                b.computeRadius();
                 b.mass = 80.0f;
                 b.dragCoef = 0.8f;
                 b.crossSection = 0.7f;
@@ -699,19 +700,13 @@ struct App {
         }
 
         if (e.type == SDL_MOUSEMOTION) {
-            int dw, dh; SDL_GL_GetDrawableSize(window, &dw, &dh);
-            int ww, wh; SDL_GetWindowSize(window, &ww, &wh);
-            float sx = (float)dw/ww, sy = (float)dh/wh;
-            float fx = e.motion.x * sx, fy = e.motion.y * sy;
+            float fx = e.motion.x * s, fy = e.motion.y * s;
 
             if (isDrawing) {
                 Vec2 rel = {fx - drawOrigin.x, fy - drawOrigin.y};
                 auto& pts = currentStroke.points;
                 Vec2 last = pts.back();
-                float dd = (rel - last).mag2();
-                if (dd > 16.0f) { // ~4px threshold for smoothness
-                    pts.push_back(rel);
-                }
+                if ((rel - last).mag2() > 16.0f) pts.push_back(rel);
             }
             if (isDragging && !selected.empty()) {
                 Vec2 cur = {fx, fy};
@@ -719,20 +714,21 @@ struct App {
                 for (int idx : selected) bodies[idx].center += delta;
                 dragStart = cur;
             }
-            if (isBoxSelecting) {
-                boxEnd = {fx, fy};
-            }
+            if (isBoxSelecting) boxEnd = {fx, fy};
         }
 
         if (e.type == SDL_MOUSEBUTTONUP && e.button.button == SDL_BUTTON_LEFT) {
             if (isDrawing && currentStroke.points.size() >= 3) {
                 currentStroke.computeBounds();
                 Body b;
+                // offset is now the centroid shift from computeBounds
+                // body center = drawOrigin + offset
+                b.center = drawOrigin + currentStroke.offset;
+                currentStroke.offset = {0, 0}; // stroke is at body center
                 b.strokes.push_back(currentStroke);
-                b.center = currentStroke.center;
                 b.radius = currentStroke.radius;
-                b.mass = 5.0f; // light drawn object
-                b.crossSection = b.radius / 100.0f;
+                b.mass = 5.0f;
+                b.crossSection = fmaxf(b.radius / 100.0f, 0.1f);
                 b.dragCoef = 0.5f;
                 b.saveOrigin();
                 bodies.push_back(b);
@@ -740,17 +736,14 @@ struct App {
             isDrawing = false;
 
             if (isBoxSelecting) {
-                float x1 = fminf(boxStart.x, boxEnd.x);
-                float y1 = fminf(boxStart.y, boxEnd.y);
-                float x2 = fmaxf(boxStart.x, boxEnd.x);
-                float y2 = fmaxf(boxStart.y, boxEnd.y);
+                float x1 = fminf(boxStart.x, boxEnd.x), y1 = fminf(boxStart.y, boxEnd.y);
+                float x2 = fmaxf(boxStart.x, boxEnd.x), y2 = fmaxf(boxStart.y, boxEnd.y);
                 if (x2-x1 > 5 || y2-y1 > 5) {
                     deselectAll();
                     for (int i = 0; i < (int)bodies.size(); i++) {
                         Vec2 c = bodies[i].center;
-                        if (c.x >= x1 && c.x <= x2 && c.y >= y1 && c.y <= y2) {
+                        if (c.x >= x1 && c.x <= x2 && c.y >= y1 && c.y <= y2)
                             selectBody(i);
-                        }
                     }
                 }
                 isBoxSelecting = false;
@@ -759,24 +752,22 @@ struct App {
         }
 
         if (e.type == SDL_KEYDOWN) {
-            if (e.key.keysym.sym == SDLK_z && (e.key.keysym.mod & KMOD_GUI)) {
-                undo();
-            }
-            if (e.key.keysym.sym == SDLK_DELETE || e.key.keysym.sym == SDLK_BACKSPACE) {
-                std::sort(selected.begin(), selected.end(), std::greater<int>());
-                for (int idx : selected) bodies.erase(bodies.begin() + idx);
-                selected.clear();
-            }
+            if (e.key.keysym.sym == SDLK_z && (e.key.keysym.mod & KMOD_GUI)) undo();
+            if (e.key.keysym.sym == SDLK_DELETE || e.key.keysym.sym == SDLK_BACKSPACE) deleteSelected();
         }
     }
 
     void update(float dt) {
-        // Get drawable size for high-DPI
         int dw, dh;
         SDL_GL_GetDrawableSize(window, &dw, &dh);
         screenW = dw; screenH = dh;
 
-        // Physics
+        // Rebuild grid if size changed
+        if (screenW != lastGridW || screenH != lastGridH) {
+            gridRenderer.rebuild(screenW, screenH);
+            lastGridW = screenW; lastGridH = screenH;
+        }
+
         if (simRunning) {
             int steps = std::max(1, (int)ceilf(dt / 0.005f));
             float subDt = dt / steps;
@@ -787,8 +778,15 @@ struct App {
             }
         }
 
-        // Particles always flow
-        particles.update(dt, windPixelVel(), windDir(), windSpeed, screenW, screenH, bodies);
+        // Build flow bodies for particles
+        flowBodies.clear();
+        for (auto& b : bodies) {
+            b.computeRadius();
+            flowBodies.push_back({b.center.x, b.center.y, b.radius * b.radius});
+        }
+
+        particles.update(dt, windPixelVel(), windDir(), windSpeed, screenW, screenH,
+                         flowBodies.data(), (int)flowBodies.size());
     }
 
     void renderBodies() {
@@ -798,45 +796,27 @@ struct App {
             float b = body.selected ? 0.27f : 0.94f;
             float thick = body.selected ? 4.0f : 3.0f;
 
+            float ca = cosf(body.angle), sa = sinf(body.angle);
             for (auto& stroke : body.strokes) {
-                // Stroke world position = body center + stroke center rotated by body angle
-                float ca = cosf(body.angle), sa = sinf(body.angle);
-                Vec2 sc = {stroke.center.x*ca - stroke.center.y*sa,
-                           stroke.center.x*sa + stroke.center.y*ca};
-                Vec2 worldPos = body.center + sc;
-
+                Vec2 worldPos = body.center + Vec2{
+                    stroke.offset.x*ca - stroke.offset.y*sa,
+                    stroke.offset.x*sa + stroke.offset.y*ca
+                };
                 lineRenderer.drawThickLine(stroke.points, worldPos, body.angle,
                                            thick, r, g, b, 1.0f, screenW, screenH);
             }
         }
 
-        // Current drawing preview
         if (isDrawing && currentStroke.points.size() >= 2) {
             lineRenderer.drawThickLine(currentStroke.points, drawOrigin, 0,
                                        3.0f, 0.88f, 0.88f, 0.94f, 0.7f, screenW, screenH);
         }
 
-        // Box select preview
         if (isBoxSelecting) {
-            float x1 = fminf(boxStart.x, boxEnd.x);
-            float y1 = fminf(boxStart.y, boxEnd.y);
-            float x2 = fmaxf(boxStart.x, boxEnd.x);
-            float y2 = fmaxf(boxStart.y, boxEnd.y);
+            float x1 = fminf(boxStart.x, boxEnd.x), y1 = fminf(boxStart.y, boxEnd.y);
+            float x2 = fmaxf(boxStart.x, boxEnd.x), y2 = fmaxf(boxStart.y, boxEnd.y);
             std::vector<Vec2> box = {{x1,y1},{x2,y1},{x2,y2},{x1,y2},{x1,y1}};
             lineRenderer.drawThickLine(box, {0,0}, 0, 1.0f, 0.4f, 0.6f, 1.0f, 0.5f, screenW, screenH);
-        }
-    }
-
-    void renderGrid() {
-        // Subtle grid using lines
-        float alpha = 0.04f;
-        for (float x = 0; x < screenW; x += 50) {
-            std::vector<Vec2> line = {{x,0},{x,(float)screenH}};
-            lineRenderer.drawThickLine(line, {0,0}, 0, 1.0f, 1,1,1, alpha, screenW, screenH);
-        }
-        for (float y = 0; y < screenH; y += 50) {
-            std::vector<Vec2> line = {{0,y},{(float)screenW,y}};
-            lineRenderer.drawThickLine(line, {0,0}, 0, 1.0f, 1,1,1, alpha, screenW, screenH);
         }
     }
 
@@ -845,9 +825,7 @@ struct App {
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
 
-        // Toolbar
         ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(260, 0), ImGuiCond_FirstUseEver);
         ImGui::Begin("Tools", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
 
         if (ImGui::RadioButton("Draw", tool==0)) { tool=0; deselectAll(); }
@@ -857,28 +835,18 @@ struct App {
         if (ImGui::RadioButton("Stick", tool==2)) tool=2;
 
         ImGui::Separator();
-
-        if (ImGui::Button("Undo (Cmd+Z)")) undo();
+        if (ImGui::Button("Undo")) undo();
         ImGui::SameLine();
-        if (ImGui::Button("Delete")) {
-            std::sort(selected.begin(), selected.end(), std::greater<int>());
-            for (int idx : selected) bodies.erase(bodies.begin() + idx);
-            selected.clear();
-        }
-
+        if (ImGui::Button("Delete")) deleteSelected();
         if (selected.size() >= 2) {
             ImGui::SameLine();
-            if (ImGui::Button("Group into Body")) groupSelected();
+            if (ImGui::Button("Group")) groupSelected();
         }
 
         ImGui::Separator();
-
-        bool wasRunning = simRunning;
         if (ImGui::Button(simRunning ? "Pause" : "Play")) {
             simRunning = !simRunning;
-            if (simRunning && !wasRunning) {
-                for (auto& b : bodies) b.saveOrigin();
-            }
+            if (simRunning) for (auto& b : bodies) b.saveOrigin();
         }
         ImGui::SameLine();
         if (ImGui::Button("Reset")) {
@@ -887,57 +855,44 @@ struct App {
         }
 
         ImGui::Separator();
-
         ImGui::SliderFloat("Wind m/s", &windSpeed, 0, 80);
         ImGui::SliderFloat("Direction", &windAngleDeg, 0, 359);
 
-        ImGui::Separator();
-
         if (!selected.empty()) {
-            if (ImGui::Button("-5 deg")) {
-                for (int i : selected) bodies[i].angle -= 5.0f * M_PI / 180.0f;
-            }
+            ImGui::Separator();
+            if (ImGui::Button("-5 deg")) { for (int i : selected) bodies[i].angle -= 5.0f*M_PI/180.0f; }
             ImGui::SameLine();
-            if (ImGui::Button("+5 deg")) {
-                for (int i : selected) bodies[i].angle += 5.0f * M_PI / 180.0f;
-            }
+            if (ImGui::Button("+5 deg")) { for (int i : selected) bodies[i].angle += 5.0f*M_PI/180.0f; }
         }
 
-        ImGui::Text("Particles: %d", particles.count);
-        ImGui::Text("Bodies: %d", (int)bodies.size());
-
+        ImGui::Text("Particles: %d | Bodies: %d", particles.count, (int)bodies.size());
         ImGui::End();
 
-        // Metadata panel for selected body
         if (selected.size() == 1) {
             Body& b = bodies[selected[0]];
-            ImGui::SetNextWindowPos(ImVec2((float)screenW/ImGui::GetIO().DisplayFramebufferScale.x - 230, 10), ImGuiCond_FirstUseEver);
-            ImGui::SetNextWindowSize(ImVec2(220, 0), ImGuiCond_FirstUseEver);
+            float panelX = (float)screenW / dpiScale() - 230;
+            ImGui::SetNextWindowPos(ImVec2(panelX, 10), ImGuiCond_FirstUseEver);
             ImGui::Begin("Metadata", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
-
-            ImGui::Text("Angle: %.1f deg", fmodf(b.angle * 180.0f / M_PI, 360.0f));
+            ImGui::Text("Angle: %.1f deg", fmodf(b.angle*180.0f/M_PI, 360.0f));
             ImGui::Text("Radius: %.0f px", b.radius);
-            ImGui::Text("Strokes: %d", (int)b.strokes.size());
             ImGui::Separator();
-            ImGui::Text("Altitude: %.0f m (%.0f ft)", b.altitude, b.altitude * 3.281f);
-            ImGui::Text("Air Density: %.3f kg/m3", b.airDensity);
+            ImGui::Text("Altitude: %.0f m (%.0f ft)", b.altitude, b.altitude*3.281f);
+            ImGui::Text("Air: %.3f kg/m3", b.airDensity);
             ImGui::Separator();
-            ImGui::Text("Speed: %.1f m/s (%.0f mph)", b.speedMps, b.speedMps * 2.237f);
-            ImGui::Text("Terminal V: %.1f m/s (%.0f mph)", b.terminalV, b.terminalV * 2.237f);
+            ImGui::Text("Speed: %.1f m/s (%.0f mph)", b.speedMps, b.speedMps*2.237f);
+            ImGui::Text("Terminal: %.1f m/s (%.0f mph)", b.terminalV, b.terminalV*2.237f);
             ImGui::Text("Rel Wind: %.1f m/s", b.relWindSpeed);
             ImGui::Text("AoA: %.1f deg", b.relWindAngle);
             ImGui::Separator();
-            ImGui::SliderFloat("Mass kg", &b.mass, 1, 150);
+            ImGui::SliderFloat("Mass", &b.mass, 1, 150);
             ImGui::SliderFloat("Cd", &b.dragCoef, 0.1f, 1.5f);
-            ImGui::SliderFloat("Area m2", &b.crossSection, 0.1f, 2.0f);
+            ImGui::SliderFloat("Area", &b.crossSection, 0.1f, 2.0f);
             ImGui::Checkbox("Pinned", &b.pinned);
-
             ImGui::End();
         } else if (selected.size() > 1) {
-            ImGui::SetNextWindowPos(ImVec2((float)screenW/ImGui::GetIO().DisplayFramebufferScale.x - 230, 10), ImGuiCond_FirstUseEver);
             ImGui::Begin("Group", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
-            ImGui::Text("%d objects selected", (int)selected.size());
-            if (ImGui::Button("Group into Single Body")) groupSelected();
+            ImGui::Text("%d selected", (int)selected.size());
+            if (ImGui::Button("Group into Body")) groupSelected();
             ImGui::End();
         }
 
@@ -950,12 +905,11 @@ struct App {
         glClearColor(0.05f, 0.05f, 0.08f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
 
-        renderGrid();
+        gridRenderer.render(screenW, screenH);
 
-        // Particles
         glUseProgram(particleProgram);
         glUniform2f(glGetUniformLocation(particleProgram, "uScreen"), (float)screenW, (float)screenH);
-        particles.uploadAndRender(screenW, screenH);
+        particles.uploadAndRender();
 
         renderBodies();
         renderUI();
@@ -979,8 +933,7 @@ struct App {
             }
 
             Uint64 now = SDL_GetPerformanceCounter();
-            float dt = (float)(now - lastTick) / freq;
-            dt = fminf(dt, 0.05f);
+            float dt = fminf((float)(now - lastTick) / freq, 0.05f);
             lastTick = now;
 
             update(dt);
@@ -989,6 +942,7 @@ struct App {
 
         particles.cleanup();
         lineRenderer.cleanup();
+        gridRenderer.cleanup();
         glDeleteProgram(particleProgram);
         ImGui_ImplOpenGL3_Shutdown();
         ImGui_ImplSDL2_Shutdown();
