@@ -3,49 +3,43 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Wind Simulator - Skydiver Freefall</title>
+  <title>Wind Simulator</title>
   <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
   <div id="app">
     <header id="toolbar">
       <div class="tool-group">
-        <span class="group-label">Draw</span>
-        <button id="btn-select" class="tool-btn active" title="Select / Move">SEL</button>
-        <button id="btn-pencil" class="tool-btn" title="Freeform Draw">PEN</button>
-        <button id="btn-line" class="tool-btn" title="Line Segment">LINE</button>
-        <button id="btn-rect" class="tool-btn" title="Rectangle">RECT</button>
-        <button id="btn-circle" class="tool-btn" title="Circle">CIRC</button>
-        <button id="btn-stick" class="tool-btn" title="Stick Figure">STICK</button>
+        <button id="btn-select" class="tool-btn active">SEL</button>
+        <button id="btn-pencil" class="tool-btn">PEN</button>
+        <button id="btn-line" class="tool-btn">LINE</button>
+        <button id="btn-rect" class="tool-btn">RECT</button>
+        <button id="btn-circle" class="tool-btn">CIRC</button>
+        <button id="btn-stick" class="tool-btn">STICK</button>
       </div>
       <div class="tool-group">
-        <span class="group-label">Sim</span>
-        <button id="btn-play" class="tool-btn">PLAY</button>
-        <button id="btn-pause" class="tool-btn">PAUSE</button>
+        <button id="btn-toggle-sim" class="tool-btn">PLAY</button>
         <button id="btn-reset" class="tool-btn">RESET</button>
       </div>
       <div class="tool-group">
-        <span class="group-label">Wind</span>
-        <label>Speed <input id="wind-speed" type="range" min="0" max="80" value="30"></label>
+        <label>Wind <input id="wind-speed" type="range" min="0" max="80" value="30"></label>
         <span id="wind-speed-val">30 m/s</span>
         <label>Dir <input id="wind-dir" type="range" min="0" max="359" value="270"></label>
-        <span id="wind-dir-val">270deg</span>
+        <span id="wind-dir-val">270</span>
       </div>
       <div class="tool-group">
-        <span class="group-label">Transform</span>
-        <button id="btn-rot-ccw" class="tool-btn" title="Rotate -5deg">-5</button>
-        <button id="btn-rot-cw" class="tool-btn" title="Rotate +5deg">+5</button>
-        <button id="btn-flip-h" class="tool-btn" title="Flip Horizontal">FLIP</button>
-        <button id="btn-delete" class="tool-btn danger" title="Delete Selected">DEL</button>
+        <button id="btn-rot-ccw" class="tool-btn">-5</button>
+        <button id="btn-rot-cw" class="tool-btn">+5</button>
+        <button id="btn-delete" class="tool-btn danger">DEL</button>
       </div>
     </header>
 
     <div id="workspace">
       <canvas id="sim-canvas"></canvas>
       <aside id="meta-panel">
-        <h3>Object Metadata</h3>
+        <h3>Metadata</h3>
         <div id="meta-content">
-          <p class="placeholder">Select an object to see its properties</p>
+          <p class="placeholder">Select an object</p>
         </div>
       </aside>
     </div>

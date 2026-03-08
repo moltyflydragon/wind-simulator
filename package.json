@@ -1,0 +1,30 @@
+{
+  "name": "wind-simulator",
+  "version": "1.0.0",
+  "description": "Wind simulator for skydivers in freefall",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build:mac": "electron-builder --mac",
+    "build:win": "electron-builder --win",
+    "build": "electron-builder --mac --win"
+  },
+  "build": {
+    "appId": "com.windsim.app",
+    "productName": "Wind Simulator",
+    "files": [
+      "**/*",
+      "!node_modules/.cache/**"
+    ],
+    "mac": {
+      "target": "dmg"
+    },
+    "win": {
+      "target": "nsis"
+    }
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.0.0"
+  }
+}

@@ -82,23 +82,6 @@ class SimObject {
         break;
     }
 
-    // Draw angle indicator
-    if (this.selected) {
-      ctx.strokeStyle = 'rgba(255, 170, 68, 0.4)';
-      ctx.lineWidth = 1;
-      ctx.setLineDash([4, 4]);
-      ctx.beginPath();
-      ctx.moveTo(0, 0);
-      ctx.lineTo(this.boundingRadius + 15, 0);
-      ctx.stroke();
-      ctx.setLineDash([]);
-
-      // Bounding circle
-      ctx.strokeStyle = 'rgba(255, 170, 68, 0.15)';
-      ctx.beginPath();
-      ctx.arc(0, 0, this.boundingRadius, 0, Math.PI * 2);
-      ctx.stroke();
-    }
 
     ctx.restore();
   }
