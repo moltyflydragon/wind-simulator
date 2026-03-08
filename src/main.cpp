@@ -92,15 +92,67 @@ struct Body {
     }
 };
 
+// ── World Segments (precomputed each frame for particle interaction) ─────────
+// Particles deflect against actual stroke line segments, not bounding circles.
+// This gives detailed flow: wind wrapping around the head, between arms, etc.
+
+struct Seg { float ax, ay, bx, by, nx, ny; }; // endpoints + outward normal
+
+static std::vector<Seg> worldSegs;
+static std::vector<float> bodyBoundX, bodyBoundY, bodyBoundR2; // broad phase
+
+void buildWorldSegs(const std::vector<Body>& bodies) {
+    worldSegs.clear();
+    bodyBoundX.clear(); bodyBoundY.clear(); bodyBoundR2.clear();
+    for (auto& body : bodies) {
+        bodyBoundX.push_back(body.center.x);
+        bodyBoundY.push_back(body.center.y);
+        float R = body.radius + 20; // expand for influence zone
+        bodyBoundR2.push_back(R * R);
+
+        float ca = cosf(body.angle), sa = sinf(body.angle);
+        for (auto& st : body.strokes) {
+            Vec2 wo = body.center + Vec2{st.offset.x*ca - st.offset.y*sa, st.offset.x*sa + st.offset.y*ca};
+            for (size_t j = 0; j + 1 < st.points.size(); j++) {
+                Vec2 a = st.points[j].rotate(body.angle);
+                Vec2 b = st.points[j+1].rotate(body.angle);
+                Vec2 wa = {wo.x + a.x, wo.y + a.y};
+                Vec2 wb = {wo.x + b.x, wo.y + b.y};
+                // Segment normal (perpendicular, pick consistent side)
+                Vec2 d = wb - wa;
+                float len = d.mag();
+                if (len < 0.5f) continue;
+                Vec2 n = {-d.y / len, d.x / len}; // left normal
+                worldSegs.push_back({wa.x, wa.y, wb.x, wb.y, n.x, n.y});
+            }
+        }
+    }
+}
+
+// Closest point on segment AB to point P, returns distance squared
+float closestPointOnSeg(float px, float py, float ax, float ay, float bx, float by,
+                        float& outX, float& outY) {
+    float dx = bx - ax, dy = by - ay;
+    float len2 = dx*dx + dy*dy;
+    if (len2 < 0.01f) { outX = ax; outY = ay; float ex=px-ax,ey=py-ay; return ex*ex+ey*ey; }
+    float t = ((px-ax)*dx + (py-ay)*dy) / len2;
+    t = fmaxf(0, fminf(1, t));
+    outX = ax + t * dx;
+    outY = ay + t * dy;
+    float ex = px - outX, ey = py - outY;
+    return ex*ex + ey*ey;
+}
+
 // ── Particles ───────────────────────────────────────────────────────────────
-// Air is everywhere. Particles flow with wind across the entire screen.
-// Near body surfaces they deflect gently based on the surface — no void, no dead zone.
+// Air is everywhere. Particles deflect against actual stroke geometry.
 
 static constexpr int MAX_P = 35000;
+static constexpr float SEG_INFLUENCE = 25.0f; // pixels: how far segments affect particles
+static constexpr float SEG_INF2 = SEG_INFLUENCE * SEG_INFLUENCE;
 
 struct Particles {
     float* px; float* py; float* life;
-    float* buf; // upload buffer
+    float* buf;
     int count = 0;
     float spawnAccum = 0;
     GLuint vao = 0, vbo = 0;
@@ -116,30 +168,31 @@ struct Particles {
         glBindVertexArray(0);
     }
 
-    void update(float dt, float wx, float wy, float windSpeed,
-                int sw, int sh, const std::vector<Body>& bodies) {
+    void update(float dt, float wx, float wy, float windSpeed, int sw, int sh) {
         if (windSpeed < 0.5f) { count = 0; return; }
 
         float w = (float)sw, h = (float)sh;
-        float wdx = wx / (windSpeed * 10.0f + 0.001f); // normalized wind dir
+        float wdx = wx / (windSpeed * 10.0f + 0.001f);
         float wdy = wy / (windSpeed * 10.0f + 0.001f);
+        int nSegs = (int)worldSegs.size();
+        int nBodies = (int)bodyBoundX.size();
+        const Seg* segs = worldSegs.data();
 
-        // Spawn across the screen — wind comes from everywhere
+        // Spawn
         spawnAccum += windSpeed * 500.0f * dt;
         int toSpawn = (int)spawnAccum; spawnAccum -= toSpawn;
         for (int i = 0; i < toSpawn && count < MAX_P; i++) {
             int idx = count++;
             float r = (float)rand()/RAND_MAX;
-            // Mix: 70% from upwind edge, 30% scattered across screen
             if (r < 0.3f) {
                 px[idx] = ((float)rand()/RAND_MAX) * w;
                 py[idx] = ((float)rand()/RAND_MAX) * h;
             } else if (fabsf(wdx) > fabsf(wdy)) {
-                px[idx] = wdx > 0 ? ((float)rand()/RAND_MAX) * -15.0f : w + ((float)rand()/RAND_MAX)*15.0f;
+                px[idx] = wdx > 0 ? ((float)rand()/RAND_MAX)*-15 : w+((float)rand()/RAND_MAX)*15;
                 py[idx] = ((float)rand()/RAND_MAX) * h;
             } else {
                 px[idx] = ((float)rand()/RAND_MAX) * w;
-                py[idx] = wdy > 0 ? ((float)rand()/RAND_MAX) * -15.0f : h + ((float)rand()/RAND_MAX)*15.0f;
+                py[idx] = wdy > 0 ? ((float)rand()/RAND_MAX)*-15 : h+((float)rand()/RAND_MAX)*15;
             }
             life[idx] = 0.4f + ((float)rand()/RAND_MAX) * 0.6f;
         }
@@ -151,46 +204,68 @@ struct Particles {
             float pl = life[i] - decay;
             if (pl <= 0 || px[i] < -60 || px[i] > w+60 || py[i] < -60 || py[i] > h+60) continue;
 
-            // Base movement: wind
             float vx = wx, vy = wy;
+            float ppx = px[i], ppy = py[i];
 
-            // Near bodies: gentle deflection along surface normal
-            // NOT a void — just a nudge. Wind hits everything.
-            for (auto& body : bodies) {
-                float dx = px[i] - body.center.x;
-                float dy = py[i] - body.center.y;
-                float d2 = dx*dx + dy*dy;
-                float R = body.radius;
+            // Broad phase: check if near any body
+            bool nearBody = false;
+            for (int b = 0; b < nBodies; b++) {
+                float dx = ppx - bodyBoundX[b], dy = ppy - bodyBoundY[b];
+                if (dx*dx + dy*dy < bodyBoundR2[b]) { nearBody = true; break; }
+            }
 
-                if (d2 < R * R * 4.0f && d2 > 0.1f) {
-                    float dist = sqrtf(d2);
-                    float nx = dx / dist, ny = dy / dist;
+            if (nearBody) {
+                // Narrow phase: check against actual segments
+                float closestD2 = 1e9f;
+                float closestNx = 0, closestNy = 0;
+                float closestCx = 0, closestCy = 0;
 
-                    if (dist < R) {
-                        // Inside body: wind flows along the surface (tangent)
-                        // Remove the component going into the body
-                        float intoBody = vx * (-nx) + vy * (-ny);
-                        if (intoBody > 0) {
-                            vx += nx * intoBody * 0.8f;
-                            vy += ny * intoBody * 0.8f;
+                for (int s = 0; s < nSegs; s++) {
+                    float cx, cy;
+                    float d2 = closestPointOnSeg(ppx, ppy, segs[s].ax, segs[s].ay,
+                                                  segs[s].bx, segs[s].by, cx, cy);
+                    if (d2 < closestD2) {
+                        closestD2 = d2;
+                        closestCx = cx; closestCy = cy;
+                        closestNx = segs[s].nx; closestNy = segs[s].ny;
+                    }
+                }
+
+                if (closestD2 < SEG_INF2 && closestD2 > 0.1f) {
+                    float dist = sqrtf(closestD2);
+                    // Normal from segment surface toward particle
+                    float toPx = ppx - closestCx, toPy = ppy - closestCy;
+                    float toLen = sqrtf(toPx*toPx + toPy*toPy);
+                    if (toLen > 0.1f) {
+                        float nx = toPx / toLen, ny = toPy / toLen;
+                        float strength = 1.0f - dist / SEG_INFLUENCE; // 1 at surface, 0 at edge
+
+                        // Reflect wind component going into the surface
+                        float into = vx * (-nx) + vy * (-ny);
+                        if (into > 0) {
+                            vx += nx * into * strength * 1.2f;
+                            vy += ny * into * strength * 1.2f;
                         }
-                        // Slight turbulence
-                        vx += ((float)rand()/RAND_MAX - 0.5f) * windSpeed * 2.0f;
-                        vy += ((float)rand()/RAND_MAX - 0.5f) * windSpeed * 2.0f;
-                    } else {
-                        // Near body: gradual deflection (stronger closer)
-                        float t = 1.0f - (dist - R) / R; // 1 at surface, 0 at 2R
-                        float intoBody = vx * (-nx) + vy * (-ny);
-                        if (intoBody > 0) {
-                            vx += nx * intoBody * t * 0.5f;
-                            vy += ny * intoBody * t * 0.5f;
+
+                        // Very close: add turbulence (boundary layer)
+                        if (dist < 8.0f) {
+                            float turb = (8.0f - dist) / 8.0f;
+                            vx += ((float)rand()/RAND_MAX - 0.5f) * windSpeed * turb * 3.0f;
+                            vy += ((float)rand()/RAND_MAX - 0.5f) * windSpeed * turb * 3.0f;
+                        }
+
+                        // Slight acceleration around edges (Bernoulli)
+                        float tangent = vx * (-ny) + vy * nx; // tangential component
+                        if (strength > 0.3f) {
+                            vx += (-ny) * fabsf(tangent) * strength * 0.15f;
+                            vy += nx * fabsf(tangent) * strength * 0.15f;
                         }
                     }
                 }
             }
 
-            px[alive] = px[i] + vx * dt;
-            py[alive] = py[i] + vy * dt;
+            px[alive] = ppx + vx * dt;
+            py[alive] = ppy + vy * dt;
             life[alive] = pl;
             alive++;
         }
@@ -490,13 +565,24 @@ struct App {
                 for(int i=(int)bodies.size()-1;i>=0;i--) if(bodies[i].hitTest({fx,fy})){selBody(i);isDrag=true;dragSt={fx,fy};return;}
                 isBox=true; boxA=boxB={fx,fy};
             } else if(tool==2) {
-                Body b; float h=80,hr=h*0.15f;
+                Body b; float h=90;
+                float headR=8, headY=-h*0.42f;
+                float neckY=headY+headR, shoulderY=neckY+h*0.08f;
+                float hipY=shoulderY+h*0.30f;
+                float armLen=h*0.22f, legLen=h*0.32f;
                 auto mkS=[](std::vector<Vec2> pts){Stroke s; s.offset={0,0}; s.points=pts; s.computeBounds(); return s;};
+                // Head: smooth circle with 32 points
                 std::vector<Vec2> headPts;
-                for(int i=0;i<=20;i++){float a=(float)i/20*2*M_PI; headPts.push_back({cosf(a)*hr,-h/2+hr+sinf(a)*hr});}
-                float armY=-h/2+hr*2+h*0.12f, hipY=-h/2+hr*2+h*0.4f;
-                b.strokes={mkS(headPts), mkS({{0,-h/2+hr*2},{0,hipY}}), mkS({{-h*0.25f,armY},{h*0.25f,armY}}),
-                    mkS({{0,hipY},{-h*0.18f,hipY+h*0.3f}}), mkS({{0,hipY},{h*0.18f,hipY+h*0.3f}})};
+                for(int i=0;i<=32;i++){float a=(float)i/32*2*M_PI; headPts.push_back({cosf(a)*headR, headY+sinf(a)*headR});}
+                // Torso
+                std::vector<Vec2> torso={{0,neckY},{0,hipY}};
+                // Arms (slightly angled down)
+                std::vector<Vec2> armL={{0,shoulderY},{-armLen,shoulderY+h*0.05f}};
+                std::vector<Vec2> armR={{0,shoulderY},{armLen,shoulderY+h*0.05f}};
+                // Legs
+                std::vector<Vec2> legL={{0,hipY},{-h*0.12f,hipY+legLen}};
+                std::vector<Vec2> legR={{0,hipY},{h*0.12f,hipY+legLen}};
+                b.strokes={mkS(headPts), mkS(torso), mkS(armL), mkS(armR), mkS(legL), mkS(legR)};
                 b.center={fx,fy}; b.computeRadius(); b.mass=80; b.dragCoef=0.8f; b.crossSection=0.7f; b.saveOrigin();
                 bodies.push_back(b);
             }
@@ -544,8 +630,9 @@ struct App {
         if(simOn) { int steps=std::max(1,(int)ceilf(dt/0.005f)); float sd=dt/steps;
             for(int s=0;s<steps;s++) for(auto& b:bodies) physicsStep(b,sd,wVel()); }
         for(auto& b:bodies) b.computeRadius();
+        buildWorldSegs(bodies);
         Vec2 wp=wPx();
-        parts.update(dt, wp.x, wp.y, windSpd, sw, sh, bodies);
+        parts.update(dt, wp.x, wp.y, windSpd, sw, sh);
     }
 
     void render() {
